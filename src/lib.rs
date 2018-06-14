@@ -58,7 +58,7 @@ pub fn start(pool: Pool<PostgresConnectionManager>, amqp_uri: &str, bridge_chann
 fn spawn_listener_publisher(pg_conn: PooledConnection<PostgresConnectionManager>,
                             amqp_uri: String, binding: Binding, delivery_mode: u8) -> JoinHandle<()> {
   thread::spawn(move ||{
-
+    info!("spawning listener");
     let mut channel_counter = ChannelCounter::new();
     let mut session = wait_for_amqp_session(&amqp_uri, binding.pg_channel.as_str());
     let amqp_entity_type = match get_amq_entity_type(
@@ -81,7 +81,9 @@ fn spawn_listener_publisher(pg_conn: PooledConnection<PostgresConnectionManager>
     let notifications = pg_conn.notifications();
     let mut it = notifications.blocking_iter();
 
+    info!("Waiting for notifications");
     while let Ok(Some(notification)) = it.next() {
+      info!("Received notification!");
       let (routing_key, message) = parse_notification(&notification.payload);
       let (exchange, key) =
         if amqp_entity_type == Type::Exchange {
@@ -90,13 +92,16 @@ fn spawn_listener_publisher(pg_conn: PooledConnection<PostgresConnectionManager>
           ("", binding.amqp_entity.as_str())
         };
 
+      info!("Publishing to local channel");
       let mut publication = local_channel.basic_publish(
           exchange, key, true, false,
           protocol::basic::BasicProperties{ content_type: Some("text".to_string()), delivery_mode: Some(delivery_mode), ..Default::default()},
           message.as_bytes().to_vec());
 
+      info!("Published to local channel");
       // When RMQ connection is lost retry it
       if let Err(e@AMQPError::IoError(_)) = publication {
+        error!("Lost connection to RMQ");
         error!("{:?}", e);
         session = wait_for_amqp_session(amqp_uri.as_str(), binding.pg_channel.as_str());
         local_channel = match get_amq_entity_type(
@@ -115,6 +120,8 @@ fn spawn_listener_publisher(pg_conn: PooledConnection<PostgresConnectionManager>
             exchange, key, true, false,
             protocol::basic::BasicProperties{ content_type: Some("text".to_string()), delivery_mode: Some(delivery_mode), ..Default::default()},
             message.as_bytes().to_vec());
+
+        info!("Republished message");
       }
 
       match publication{
@@ -126,6 +133,7 @@ fn spawn_listener_publisher(pg_conn: PooledConnection<PostgresConnectionManager>
       }
     }
 
+    info!("Terminating thread!");
     local_channel.close(200, "").unwrap();
     session.close(200, "");
   })
@@ -221,7 +229,7 @@ mod tests {
               Binding{pg_channel: "pgchannel1".to_string(), amqp_entity: "exchange1".to_string()},
               Binding{pg_channel: "pgchannel2".to_string(), amqp_entity: "exchange2".to_string()}
             ] == parse_bridge_channels("pgchannel1:exchange1,pgchannel2:exchange2"));
-    assert!(vec![
+            assert!(vec![
               Binding{pg_channel: "pgchannel1".to_string(), amqp_entity: "exchange1".to_string()},
               Binding{pg_channel: "pgchannel2".to_string(), amqp_entity: "exchange2".to_string()},
               Binding{pg_channel: "pgchannel3".to_string(), amqp_entity: "exchange3".to_string()}
