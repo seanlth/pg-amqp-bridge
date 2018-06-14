@@ -38,9 +38,9 @@ fn main() {
   env_logger::init().unwrap();
   let config = Config::new();
 
-  info!("Entering main loop!");
+  println!("Entering main loop!");
   loop {
-    info!("Opening connections to postgres");
+    println!("Opening connections to postgres");
     let pool = wait_for_pg_connection(&config.postgresql_uri);
     // This functions spawns threads for each pg channel and waits for the threads to finish,
     // that only occurs when the threads die due to a pg connection error
