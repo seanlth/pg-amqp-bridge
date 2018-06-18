@@ -7,7 +7,7 @@ extern crate postgres;
 
 use amqp::{Session, Basic, protocol, Channel, Table, AMQPError};
 use fallible_iterator::FallibleIterator;
-use r2d2::{Pool, PooledConnection};
+use r2d2::{Pool, PooledConnection, ManageConnection};
 use r2d2_postgres::{PostgresConnectionManager};
 use std::default::Default;
 use std::thread;
@@ -55,6 +55,10 @@ pub fn start(pool: Pool<PostgresConnectionManager>, amqp_uri: &str, bridge_chann
   }
 }
 
+fn is_connection_alive(connection: &postgres::Connection) -> bool {
+    connection.batch_execute("").is_ok()
+}
+
 fn spawn_listener_publisher(pg_conn: PooledConnection<PostgresConnectionManager>,
                             amqp_uri: String, binding: Binding, delivery_mode: u8) -> JoinHandle<()> {
   thread::spawn(move ||{
@@ -79,59 +83,72 @@ fn spawn_listener_publisher(pg_conn: PooledConnection<PostgresConnectionManager>
     println!("Listening on {}...", binding.pg_channel);
 
     let notifications = pg_conn.notifications();
-    let mut it = notifications.blocking_iter();
+    let mut it = notifications.timeout_iter(Duration::new(60, 0));
 
-    info!("Waiting for notifications");
-    while let Ok(Some(notification)) = it.next() {
-      info!("Received notification!");
-      let (routing_key, message) = parse_notification(&notification.payload);
-      let (exchange, key) =
-        if amqp_entity_type == Type::Exchange {
-          (binding.amqp_entity.as_str(), routing_key)
-        } else {
-          ("", binding.amqp_entity.as_str())
-        };
+    let mut connected = true;
 
-      info!("Publishing to local channel");
-      let mut publication = local_channel.basic_publish(
-          exchange, key, true, false,
-          protocol::basic::BasicProperties{ content_type: Some("text".to_string()), delivery_mode: Some(delivery_mode), ..Default::default()},
-          message.as_bytes().to_vec());
+    while connected {
+        info!("Waiting for notifications");
+        while let Ok(Some(notification)) = it.next() {
+          info!("Received notification!");
+          let (routing_key, message) = parse_notification(&notification.payload);
+          let (exchange, key) =
+            if amqp_entity_type == Type::Exchange {
+              (binding.amqp_entity.as_str(), routing_key)
+            } else {
+              ("", binding.amqp_entity.as_str())
+            };
 
-      info!("Published to local channel");
-      // When RMQ connection is lost retry it
-      if let Err(e@AMQPError::IoError(_)) = publication {
-        error!("Lost connection to RMQ");
-        error!("{:?}", e);
-        session = wait_for_amqp_session(amqp_uri.as_str(), binding.pg_channel.as_str());
-        local_channel = match get_amq_entity_type(
-          &mut session.open_channel(channel_counter.inc()).unwrap(),
-          &mut session.open_channel(channel_counter.inc()).unwrap(),
-          &binding.amqp_entity){
-            None      => {
-              error!("The amqp entity {:?} doesn't exist", binding.amqp_entity);
-              std::process::exit(1);
+          info!("Publishing to local channel");
+          let mut publication = local_channel.basic_publish(
+              exchange, key, true, false,
+              protocol::basic::BasicProperties{ content_type: Some("text".to_string()), delivery_mode: Some(delivery_mode), ..Default::default()},
+              message.as_bytes().to_vec());
+
+          info!("Published to local channel");
+          // When RMQ connection is lost retry it
+          if let Err(e@AMQPError::IoError(_)) = publication {
+            error!("Lost connection to RMQ");
+            error!("{:?}", e);
+            session = wait_for_amqp_session(amqp_uri.as_str(), binding.pg_channel.as_str());
+            local_channel = match get_amq_entity_type(
+              &mut session.open_channel(channel_counter.inc()).unwrap(),
+              &mut session.open_channel(channel_counter.inc()).unwrap(),
+              &binding.amqp_entity){
+                None      => {
+                  error!("The amqp entity {:?} doesn't exist", binding.amqp_entity);
+                  std::process::exit(1);
+                },
+                Some(_) => session.open_channel(channel_counter.inc()).unwrap()
+            };
+            // Republish message
+            publication =
+              local_channel.basic_publish(
+                exchange, key, true, false,
+                protocol::basic::BasicProperties{ content_type: Some("text".to_string()), delivery_mode: Some(delivery_mode), ..Default::default()},
+                message.as_bytes().to_vec());
+
+            info!("Republished message");
+          }
+
+          match publication{
+            Ok(_) => {
+              info!("{:?} -> {:?} {:?} ( routing_key: {:?}, message: {:?} )",
+                    binding.pg_channel, amqp_entity_type, binding.amqp_entity, routing_key, message);
             },
-            Some(_) => session.open_channel(channel_counter.inc()).unwrap()
-        };
-        // Republish message
-        publication =
-          local_channel.basic_publish(
-            exchange, key, true, false,
-            protocol::basic::BasicProperties{ content_type: Some("text".to_string()), delivery_mode: Some(delivery_mode), ..Default::default()},
-            message.as_bytes().to_vec());
+            Err(e)  => error!("{:?}", e)
+          }
+        }
+        info!("Timeout!");
 
-        info!("Republished message");
-      }
-
-      match publication{
-        Ok(_) => {
-          info!("{:?} -> {:?} {:?} ( routing_key: {:?}, message: {:?} )",
-                binding.pg_channel, amqp_entity_type, binding.amqp_entity, routing_key, message);
-        },
-        Err(e)  => error!("{:?}", e)
-      }
+        if !is_connection_alive(&*pg_conn) {
+            info!("Connection has died!");
+            connected = false
+        }
     }
+
+
+
 
     info!("Terminating thread!");
     local_channel.close(200, "").unwrap();
