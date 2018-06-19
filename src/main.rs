@@ -2,12 +2,15 @@ extern crate env_logger;
 extern crate pg_amqp_bridge as bridge;
 extern crate r2d2;
 extern crate r2d2_postgres;
+extern crate postgres;
 
 use std::env;
 use std::thread;
 use std::time::Duration;
 use r2d2::{Pool, ManageConnection};
 use r2d2_postgres::{TlsMode, PostgresConnectionManager};
+use postgres::params::{ConnectParams, Builder};
+use postgres::params::IntoConnectParams;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -41,7 +44,24 @@ fn main() {
   println!("Entering main loop!");
   loop {
     println!("Opening connections to postgres");
-    let pool = wait_for_pg_connection(&config.postgresql_uri);
+
+    let mut parsed_params = config.postgresql_uri.clone()
+                                                 .into_connect_params()
+                                                 .unwrap();
+
+    let user = parsed_params.user()
+                            .unwrap();
+    let name = user.name();
+    let password = user.password();
+
+    let params = Builder::new()
+                         .user(name, password)
+                         .database(parsed_params.database().unwrap())
+                         .keepalive(Some(Duration::new(60, 0)))
+                         .build(parsed_params.host().clone());
+
+
+    let pool = wait_for_pg_connection(params);
     // This functions spawns threads for each pg channel and waits for the threads to finish,
     // that only occurs when the threads die due to a pg connection error
     // and so if that happens the pg connection is retried and the bridge is started again.
@@ -49,7 +69,7 @@ fn main() {
   }
 }
 
-fn wait_for_pg_connection(pg_uri: &String) -> Pool<PostgresConnectionManager> {
+fn wait_for_pg_connection(pg_uri: ConnectParams) -> Pool<PostgresConnectionManager> {
   println!("Attempting to connect to PostgreSQL..");
   let conn = PostgresConnectionManager::new(pg_uri.to_owned(), TlsMode::None).unwrap();
   let mut i = 1;
